@@ -6,36 +6,32 @@ from pyspark.sql.avro.functions import from_avro
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.types import StructType,StructField, StringType
 
-from pyspark.sql.functions import from_unixtime,to_date,col,year,month,dayofmonth,first,desc
+from pyspark.sql.functions import from_unixtime,to_date,col,year,month,dayofmonth,first,desc,last,coalesce,regexp_replace
 
 from pyspark.sql.window import Window
 
 
-schema = StructType([
-  StructField('date', LongType(), True),
-  StructField('value', DoubleType(), True),
-  StructField('interval', StringType(), True)
-  ])
-
-
-
-
 # Build SparkSession
-spark = SparkSession.builder.master("local[*]").appName("ETL Pipeline")\
-        .config("spark.jars", "./jars/redshift-jdbc42-2.1.0.9.jar").config("spark.scheduler.mode","FAIR").master("local[*]").getOrCreate()
+spark = SparkSession.builder.master("spark://192.168.1.173:7077").appName("ETL Pipeline")\
+        .config("spark.scheduler.mode","FAIR")\
+        .config("spark.cores.max",4)\
+        .config("spark.sql.session.timeZone", "Asia/Ho_Chi_Minh")\
+        .getOrCreate()
 
 # Set Logging Level to WARN
 # spark.sparkContext.setLogLevel("WARN")
 
 # df.writeStream.outputMode("append").format("console").start().awaitTermination()
-EconomicIndicatorIndexList=["REAL_GDP",
+EconomicIndicatorIndexList=[
+        "REAL_GDP",
             "REAL_GDP_PER_CAPITA",
             "DURABLES",
             "CPI",
             "INFLATION",
             "RETAIL_SALES",
             "UNEMPLOYMENT",
-            "NONFARM_PAYROLL"
+            "NONFARM_PAYROLL",
+            "Treasury_yield"
             ]
 EconomicIndicatorIndex={}
 
@@ -51,20 +47,13 @@ def read_from_kafka_topic(topic_name):
 for topic_name in EconomicIndicatorIndexList:
         EconomicIndicatorIndex[topic_name]=read_from_kafka_topic(topic_name)
 
-        
-
-driver = "com.amazon.redshift.jdbc42.Driver"
-url='jdbc:redshift://redshift-cluster-1.cfaj06ovlgm3.us-east-1.redshift.amazonaws.com:5439/dev'	  
-user='awsuser'
-password='Truong157359'
-
-
 
 avroSchema = '''{
                         "type": "record",
                         "namespace": "bigdata_project",
                         "name": "economicIndicatorRecord",
                         "fields": [
+                        { "name": "id", "type": "long"},
                         { "name": "date", "type": "long", "logicalType": "date"},
                         { "name": "value", "type": ["double","null"] },
                         { "name": "interval", "type": "string"}
@@ -80,16 +69,39 @@ avroSchema = '''{
 # avro_deserialize_udf = psf.udf(deserialize_avro, returnType=df_schema)
 # parsed_df = df.withColumn("avro", avro_deserialize_udf(psf.col("value"))).select("avro.*")
 def avro_deserializer(df:DataFrame):
-        result=df.selectExpr("substring(value, 6) as avro_value","topic")\
+        df=df.selectExpr("substring(value, 6) as avro_value","topic")\
         .select(from_avro(col("avro_value"), avroSchema).alias("data"),"topic")\
-        .selectExpr("topic","data.date as date","data.value as value","data.interval as interval")
+        .selectExpr("data.id as id","topic","data.date as date","data.value as value","data.interval as interval")
+        result=df.replace({0:None},'value')
         return result
+
 def get_year_value(df:DataFrame):
-        windowSpec = Window().partitionBy("year").orderBy(desc("month"),desc("day"))\
+        windowSpec = Window().partitionBy("year")\
                 .rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
-        df=df.withColumn("year_value",first("value").over(windowSpec))
-        result=df.orderBy(desc("year"))
+        result=df.withColumn("year_value",first("value").over(windowSpec))
         return result
+
+def get_year_month_day(df:DataFrame):
+        # convert unixtimestamp -> datetime
+        df=df.select("id",to_date(from_unixtime(col("date")/1000)).alias("date"),"value","interval","topic") 
+        # convert datetime -> year,month,day
+        result=df.select("id","date",year(df.date).alias("year"),month(df.date).alias("month")\
+                                ,dayofmonth(df.date).alias("day"),"interval","value","topic")
+        return result
+
+def fillNA_with_mean(df:DataFrame):
+        w1 = Window.orderBy("id").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        w2 = Window.orderBy("id").rowsBetween(Window.currentRow, Window.unboundedFollowing)
+        result=df.withColumn("previous", last("value", ignorenulls = True).over(w1))\
+        .withColumn("next", first("value", ignorenulls = True).over(w2))\
+        .withColumn("value", (coalesce("previous", "next") + coalesce("next", "previous")) / 2)
+        return result
+
+driver = "org.postgresql.Driver"
+url='jdbc:postgresql://bigdata-database.ce0q5dfktsor.us-east-1.rds.amazonaws.com/postgres'	  
+user='postgres'
+password='truong157359'
+
 def write_to_redshift(df:DataFrame,table_name:string):
         df.write.format('jdbc').options(
         url=url,	  
@@ -103,26 +115,21 @@ def write_to_csv(df:DataFrame):
         df.write.mode('append')\
         .csv("./pyspark_template/spark_output/datacsv")
 
-def get_year_month_day(df:DataFrame):
-        # convert unixtimestamp -> datetime
-        df=df.select(to_date(from_unixtime(col("date")/1000)).alias("date"),"value","interval","topic") 
-        # convert datetime -> year,month,day
-        result=df.select(year(df.date).alias("year"),month(df.date).alias("month")\
-                                ,dayofmonth(df.date).alias("day"),"interval","value","topic")
-        return result
 
 def foreach_batch_function(df:DataFrame, epoch_id:int):
         if df.isEmpty():
                 return
         
         interval,table_name=df.first().interval,df.first().topic
+        df=fillNA_with_mean(df)
         # get year
         if interval=="monthly" or interval=="quarterly":
                 df=get_year_value(df) 
 
-        df=df.drop("topic").drop("date")
+        # df=df.drop("topic").drop("date")
                
         write_to_redshift(df,table_name)
+        # write_to_csv(df)
         
 
 
@@ -131,7 +138,7 @@ for topic_name,df in EconomicIndicatorIndex.items():
         EconomicIndicatorIndex[topic_name]=get_year_month_day(df)
         
 def write_stream_to_sinks(topic_name:string,df:DataFrame):
-        df.writeStream .outputMode("append").trigger(processingTime="1 minutes") \
+        df.writeStream .outputMode("update").trigger(processingTime="1 minutes") \
         .foreachBatch(lambda df,epoch_id:foreach_batch_function(df,epoch_id)) \
         .start()
         
